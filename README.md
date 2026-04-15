@@ -1,6 +1,6 @@
 # Korfbal Schedule — Home Assistant Custom Integration
 
-Haalt het wedstrijdprogramma op van **mijn.korfbal.nl** (aangedreven door Sportlink/KNKV)
+Haalt het wedstrijdprogramma en uitslagen op van **mijn.korfbal.nl** (KNKV/Sportlink)
 en biedt dit aan als een **Kalender** en **Sensoren** in Home Assistant.
 
 ---
@@ -9,7 +9,7 @@ en biedt dit aan als een **Kalender** en **Sensoren** in Home Assistant.
 
 | Entity | Beschrijving |
 |--------|-------------|
-| `calendar.korfbal_<team>_wedstrijden` | Kalender met alle wedstrijden — werkt in de HA Agenda-kaart en met Google Calendar sync |
+| `calendar.korfbal_<team>_wedstrijden` | Kalender met alle wedstrijden (programma + uitslagen) — werkt in de HA Agenda-kaart en met Google Calendar sync |
 | `sensor.korfbal_<team>_volgende_wedstrijd` | Datum/tijd van de volgende wedstrijd (+ alle details als attributen) |
 | `sensor.korfbal_<team>_aantal_wedstrijden` | Aantal aankomende wedstrijden |
 
@@ -36,6 +36,10 @@ Met HACS (aanbevolen via "Custom repository") of handmatig via SSH/Samba.
 
 ### Stap 2 — Herstart Home Assistant
 
+> ⚠️ Na het kopiëren van bestanden is een **volledige herstart** vereist.
+> Een integratie-reload is **niet** voldoende — HA herlaadt Python-modules
+> alleen bij een volledige herstart.
+
 ```
 Instellingen → Systeem → Herstart
 ```
@@ -48,20 +52,33 @@ Instellingen → Systeem → Herstart
    - **Clubcode**: `NCX35C2`  ← uit jouw URL
    - **Teamcode**: `T1200100098`  ← uit jouw URL
    - **Teamnaam**: bijv. `Heren 1`
-   - **Sportlink Client ID**: *(zie hieronder, optioneel maar aanbevolen)*
+   - **Sportlink Client ID**: *(zie hieronder, optioneel)*
 
 ---
 
 ## Gegevensbronnen — twee strategieën
 
-### Strategie A: Officiële Sportlink Club.Dataservice API (aanbevolen)
+### Strategie A: Mijn Korfbal REST API (standaard, geen API key nodig)
 
-De meest betrouwbare methode. Vereist een **Client ID** van Sportlink Services.
+Laat het `sportlink_client_id` veld leeg. De integratie gebruikt dan de
+officiële REST API die de mijn.korfbal.nl website zelf ook gebruikt:
 
-**Hoe krijg je een Client ID?**
-- Jouw korfbalvereniging moet **Club.Dataservice** hebben besteld bij Sportlink.
-- Vraag de webmaster/secretaris van je vereniging om het Client ID.
-- Of meld je zelf aan op: https://www.sportlink.nl/producten/club-dataservice/
+```
+GET https://api-mijn.korfbal.nl/api/v2/clubs/{clubCode}/program
+    ?dateFrom=YYYY-MM-DD&dateTo=YYYY-MM-DD
+
+GET https://api-mijn.korfbal.nl/api/v2/clubs/{clubCode}/results
+    ?dateFrom=YYYY-MM-DD&dateTo=YYYY-MM-DD
+```
+
+Beide endpoints geven een lijst van weekobjecten terug met alle wedstrijden
+van de hele club. De integratie filtert client-side op jouw teamcode.
+Uitslagen (inclusief scores) komen via het results-endpoint.
+
+### Strategie B: Officiële Sportlink Club.Dataservice API
+
+Vul een **Client ID** in als jouw vereniging dat heeft. Vereist een
+abonnement op **Club.Dataservice** bij Sportlink Services.
 
 **API endpoint die gebruikt wordt:**
 ```
@@ -71,16 +88,6 @@ GET https://data.sportlink.com/programma
   &aantaldagen=90
   &eigenwedstrijden=ja
 ```
-
-### Strategie B: Mijn Korfbal SPA scraper (geen API key nodig)
-
-Laat het `sportlink_client_id` veld leeg. De integratie probeert dan:
-
-1. **JSON API** van de SPA intern: `https://mijn.korfbal.nl/api/v1/teams/{teamCode}/matches`
-2. **HTML fallback**: zoekt naar bootstrapped JSON in de paginabron
-
-> ⚠️ De SPA rendert client-side. Als de JSON API endpoint wijzigt of
-> authenticatie vereist wordt, werkt alleen Strategie A nog betrouwbaar.
 
 ---
 
@@ -162,15 +169,19 @@ Of gebruik de ingebouwde HA Kalender — die is al zichtbaar na installatie.
 Gegevens worden elke **6 uur** automatisch ververst.
 Handmatig vernieuwen: **Instellingen → Apparaten & Diensten → Korfbal Schedule → Vernieuwen**.
 
+> ⚠️ Na het bijwerken van de integratie-bestanden is altijd een **volledige herstart**
+> van Home Assistant nodig. Een integratie-reload herlaadt geen Python-modules.
+
 ---
 
 ## Problemen oplossen
 
 | Probleem | Oplossing |
 |---------|-----------|
-| Geen wedstrijden zichtbaar | Controleer club- en teamcode in de URL. Voer een Sportlink Client ID in voor betrouwbare data. |
+| Geen wedstrijden zichtbaar na reload | Doe een **volledige HA herstart** — reload herlaadt geen Python-bestanden. |
+| Foutmelding in logs over club/team | Controleer clubcode en teamcode in de URL van jouw teampagina op mijn.korfbal.nl. |
 | `UpdateFailed` in logs | Netwerk probleem of API wijziging. Controleer HA logs via `Instellingen → Systeem → Logboek`. |
-| SPA scraper werkt niet | Gebruik de officiële Sportlink API (vraag Client ID bij jouw vereniging). |
+| Kalender leeg, sensoren op `unknown` | Zie logs op `korfbal` — de integratie logt nu altijd een fout als ophalen mislukt. |
 
 Log level verhogen voor debug:
 ```yaml

@@ -57,10 +57,10 @@ class KorfbalNextMatchSensor(CoordinatorEntity[KorfbalScheduleCoordinator], Sens
         return upcoming[0] if upcoming else None
 
     @property
-    def native_value(self) -> str | None:
-        """State is the ISO datetime of the next match."""
+    def native_value(self) -> datetime | None:
+        """State is the datetime of the next match (required for device_class timestamp)."""
         m = self._next_match
-        return m.start.isoformat() if m else None
+        return m.start if m else None
 
     @property
     def extra_state_attributes(self) -> dict:

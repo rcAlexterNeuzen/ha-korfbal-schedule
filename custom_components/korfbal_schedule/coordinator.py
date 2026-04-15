@@ -5,10 +5,11 @@ Two fetch strategies:
    Endpoint: https://data.sportlink.com/programma
    Docs: https://sportlinkservices.freshdesk.com/nl/support/solutions/articles/9000062942
 
-2. Mijn Korfbal public page scraper — fallback, no API key required.
-   The SPA loads data from an internal JSON endpoint that we reverse-engineer.
-   Known pattern: https://mijn.korfbal.nl/api/v1/team/{team_code}/matches
-   (observed in browser DevTools network tab)
+2. Mijn Korfbal REST API (default, no API key required).
+   Base URL: https://api-mijn.korfbal.nl/api/v2
+   Program:  GET /clubs/{clubCode}/program?dateFrom=YYYY-MM-DD&dateTo=YYYY-MM-DD
+   Results:  GET /clubs/{clubCode}/results?dateFrom=YYYY-MM-DD&dateTo=YYYY-MM-DD
+   Response: list of week-objects [{year, week, matches: [...]}]
 """
 
 from __future__ import annotations
@@ -33,8 +34,8 @@ SCAN_INTERVAL = timedelta(hours=6)
 # Sportlink Club.Dataservice base URL
 SPORTLINK_API_BASE = "https://data.sportlink.com"
 
-# Mijn Korfbal internal API (reverse-engineered from SPA network traffic)
-MIJN_KORFBAL_API = "https://mijn.korfbal.nl/api/v1"
+# Mijn Korfbal REST API (discovered from SPA JS bundle, env.competitionApiV2)
+MIJN_KORFBAL_API = "https://api-mijn.korfbal.nl/api/v2"
 
 
 @dataclass
@@ -168,154 +169,161 @@ class KorfbalScheduleCoordinator(DataUpdateCoordinator[list[KorfbalMatch]]):
             return None
 
     # ------------------------------------------------------------------ #
-    # Strategy 2: Mijn Korfbal public SPA scraper (no API key needed)    #
+    # Strategy 2: Mijn Korfbal REST API (no API key needed)              #
+    # Base: https://api-mijn.korfbal.nl/api/v2                           #
     # ------------------------------------------------------------------ #
     async def _fetch_mijn_korfbal(self, session: aiohttp.ClientSession) -> list[KorfbalMatch]:
-        """Scrape schedule from the mijn.korfbal.nl SPA internal API.
+        """Fetch schedule and results from the Mijn Korfbal REST API.
 
-        The SPA (Vue/React) loads match data from a JSON endpoint.
-        This reverse-engineers the network requests the browser makes.
-        If the endpoint changes, update MIJN_KORFBAL_API accordingly.
+        Endpoints (discovered from SPA JS bundle, env.competitionApiV2):
+          GET /clubs/{clubCode}/program?dateFrom=YYYY-MM-DD&dateTo=YYYY-MM-DD
+          GET /clubs/{clubCode}/results?dateFrom=YYYY-MM-DD&dateTo=YYYY-MM-DD
 
-        Observed endpoint from DevTools:
-          GET /api/v1/teams/{teamCode}/matches?season=current
+        Both return a list of week-objects:
+          [{year, week, matches: [{date, teams, ref_id, pool, facility, status, stats?}]}]
+
+        Matches are filtered client-side by team_code (teams.home.ref_id or
+        teams.away.ref_id).  The club endpoint returns all club teams so
+        client-side filtering is required.
         """
+        today = date.today()
+        # Cover the full korfball season: Aug previous year → Jul current year
+        date_from = date(today.year - 1, 8, 1).isoformat()
+        date_to = date(today.year + 1, 7, 31).isoformat()
+        params = {"dateFrom": date_from, "dateTo": date_to}
+
         headers = {
             "Accept": "application/json",
             "Referer": f"https://mijn.korfbal.nl/team/details/{self.club_code}/{self.team_code}/programma",
-            "X-Requested-With": "XMLHttpRequest",
         }
 
-        # Try the JSON API endpoint first
-        url = f"{MIJN_KORFBAL_API}/teams/{self.team_code}/matches"
-        _LOGGER.debug("Fetching Mijn Korfbal API: %s", url)
-
-        async with session.get(
-            url,
-            headers=headers,
-            params={"season": "current"},
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as resp:
-            if resp.status == 200:
-                try:
-                    data = await resp.json(content_type=None)
-                    matches = self._parse_mijn_korfbal_json(data)
-                    _LOGGER.info("Fetched %d matches via Mijn Korfbal JSON API", len(matches))
-                    return matches
-                except Exception as err:
-                    _LOGGER.warning("JSON parse failed (%s), falling back to HTML scraper", err)
-
-        # Fallback: parse the HTML page with regex/BeautifulSoup
-        return await self._scrape_html_page(session)
-
-    def _parse_mijn_korfbal_json(self, data: Any) -> list[KorfbalMatch]:
-        """Parse JSON response from mijn.korfbal.nl internal API."""
         matches: list[KorfbalMatch] = []
-        items = data if isinstance(data, list) else data.get("matches", data.get("data", []))
-        for item in items:
-            match = self._parse_mijn_korfbal_match(item)
-            if match:
-                matches.append(match)
+        seen_ids: set[str] = set()
+        fetch_errors = 0
+
+        for endpoint in ("program", "results"):
+            url = f"{MIJN_KORFBAL_API}/clubs/{self.club_code}/{endpoint}"
+            _LOGGER.debug("Fetching Mijn Korfbal %s: %s params=%s", endpoint, url, params)
+            try:
+                async with session.get(
+                    url,
+                    headers=headers,
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json(content_type=None)
+            except Exception as err:
+                _LOGGER.error(
+                    "Failed to fetch korfbal %s for club %s: %s",
+                    endpoint, self.club_code, err,
+                )
+                fetch_errors += 1
+                continue
+
+            is_results = endpoint == "results"
+            week_items = data if isinstance(data, list) else []
+            for week in week_items:
+                for item in week.get("matches", []):
+                    home = item.get("teams", {}).get("home", {})
+                    away = item.get("teams", {}).get("away", {})
+                    # Filter: only keep matches where our team participates
+                    if home.get("ref_id") != self.team_code and away.get("ref_id") != self.team_code:
+                        continue
+                    match = self._parse_mijn_korfbal_match(item, is_results)
+                    if match and match.match_id not in seen_ids:
+                        matches.append(match)
+                        seen_ids.add(match.match_id)
+
+        if fetch_errors == 2:
+            raise UpdateFailed(
+                f"Both program and results endpoints failed for club {self.club_code}. "
+                "Check HA logs for details."
+            )
+
+        _LOGGER.info(
+            "Fetched %d matches for team %s via Mijn Korfbal API",
+            len(matches), self.team_code,
+        )
         return matches
 
-    def _parse_mijn_korfbal_match(self, item: dict[str, Any]) -> KorfbalMatch | None:
-        """Parse a single match from the Mijn Korfbal JSON response."""
+    def _parse_mijn_korfbal_match(self, item: dict[str, Any], is_results: bool) -> KorfbalMatch | None:
+        """Parse a single match from the Mijn Korfbal REST API response.
+
+        Response shape:
+          {
+            "date": "2026-04-18T09:30:00+0200",
+            "teams": {
+              "home": {"name": "...", "ref_id": "T...", "clubRefId": "..."},
+              "away": {"name": "...", "ref_id": "T...", "clubRefId": "..."}
+            },
+            "ref_id": 54009,
+            "pool": {"name": "...", "ref_id": ...},
+            "facility": {"name": "...", "address": {"city": "..."}},
+            "status": {"game": "gepland", "status": "SCHEDULED"},
+            "stats": {                          # present on results endpoint
+              "home": {"score": 9},
+              "away": {"score": 1}
+            }
+          }
+        """
         try:
-            # Common field names observed in the SPA network traffic
-            raw_dt = (
-                item.get("startDateTime")
-                or item.get("matchDateTime")
-                or item.get("date")
-                or item.get("datum")
-            )
+            raw_dt = item.get("date")
             if not raw_dt:
                 return None
 
-            # Try ISO format first, then Dutch format
-            try:
-                start = datetime.fromisoformat(str(raw_dt).replace("Z", "+00:00"))
-                start = start.astimezone(TZ_NL)
-            except ValueError:
-                # Dutch format DD-MM-YYYY HH:MM
-                parts = str(raw_dt).split()
-                d, m, y = parts[0].split("-")
-                h, mn = (parts[1].split(":") if len(parts) > 1 else ["00", "00"])
-                start = datetime(int(y), int(m), int(d), int(h), int(mn), tzinfo=TZ_NL)
-
+            start = datetime.fromisoformat(str(raw_dt)).astimezone(TZ_NL)
             end = start + timedelta(hours=1, minutes=30)
 
-            home = item.get("homeTeam") or item.get("thuisteam", {})
-            away = item.get("awayTeam") or item.get("uitteam", {})
-            home_name = home if isinstance(home, str) else home.get("name", home.get("naam", "Thuis"))
-            away_name = away if isinstance(away, str) else away.get("name", away.get("naam", "Uit"))
+            teams = item.get("teams", {})
+            home = teams.get("home", {})
+            away = teams.get("away", {})
 
-            location_raw = item.get("location") or item.get("venue") or item.get("accommodatie") or {}
-            location = location_raw if isinstance(location_raw, str) else (
-                location_raw.get("name") or location_raw.get("naam") or
-                location_raw.get("city") or location_raw.get("plaats") or "Onbekend"
-            )
+            facility = item.get("facility") or {}
+            address = facility.get("address") or {}
+            city = address.get("city", "")
+            location = facility.get("name") or city or "Onbekend"
+            if city and city not in location:
+                location = f"{location}, {city}"
 
-            status_raw = str(item.get("status", "")).lower()
-            status = "cancelled" if "afgelast" in status_raw or "cancel" in status_raw else "scheduled"
+            pool = item.get("pool") or {}
+            competition = pool.get("name", "")
+
+            status_obj = item.get("status") or {}
+            status_raw = str(status_obj.get("status", "")).upper()
+            if status_raw in ("CANCELLED", "AFGELAST"):
+                status = "cancelled"
+            elif status_raw == "FINAL":
+                status = "played"
+            else:
+                status = "scheduled"
+
+            home_score: int | None = None
+            away_score: int | None = None
+            stats = item.get("stats") or {}
+            if stats:
+                hs = (stats.get("home") or {}).get("score")
+                as_ = (stats.get("away") or {}).get("score")
+                if hs is not None and as_ is not None:
+                    try:
+                        home_score = int(hs)
+                        away_score = int(as_)
+                        status = "played"
+                    except (ValueError, TypeError):
+                        pass
 
             return KorfbalMatch(
-                match_id=str(item.get("id") or item.get("matchId") or item.get("wedstrijdcode") or raw_dt),
-                home_team=home_name,
-                away_team=away_name,
+                match_id=str(item.get("ref_id", "")),
+                home_team=home.get("name", "Thuis"),
+                away_team=away.get("name", "Uit"),
                 start=start,
                 end=end,
                 location=location,
-                competition=str(item.get("competition") or item.get("competitie") or item.get("poule") or ""),
+                competition=competition,
                 status=status,
-                home_score=item.get("homeScore") or item.get("thuisscore"),
-                away_score=item.get("awayScore") or item.get("uitscore"),
+                home_score=home_score,
+                away_score=away_score,
             )
         except (ValueError, KeyError, TypeError, AttributeError) as err:
             _LOGGER.warning("Could not parse Mijn Korfbal match %s: %s", item, err)
             return None
-
-    async def _scrape_html_page(self, session: aiohttp.ClientSession) -> list[KorfbalMatch]:
-        """Last-resort HTML scraper using regex on the rendered page source.
-
-        NOTE: The mijn.korfbal.nl SPA renders client-side, so this fetches
-        the page shell and looks for any JSON data bootstrapped into the HTML.
-        For a fully JS-rendered page you would need a headless browser
-        (Playwright/Selenium). Consider using the Sportlink API instead.
-        """
-        import json
-        import re
-
-        url = f"https://mijn.korfbal.nl/team/details/{self.club_code}/{self.team_code}/programma"
-        _LOGGER.debug("HTML scrape fallback: %s", url)
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-            html = await resp.text()
-
-        # Look for JSON data bootstrapped into the page
-        patterns = [
-            r'window\.__INITIAL_STATE__\s*=\s*({.*?});',
-            r'window\.__data__\s*=\s*({.*?});',
-            r'"programma"\s*:\s*(\[.*?\])',
-            r'"matches"\s*:\s*(\[.*?\])',
-            r'"wedstrijden"\s*:\s*(\[.*?\])',
-        ]
-        for pattern in patterns:
-            m = re.search(pattern, html, re.DOTALL)
-            if m:
-                try:
-                    raw = json.loads(m.group(1))
-                    items = raw if isinstance(raw, list) else (
-                        raw.get("matches") or raw.get("wedstrijden") or []
-                    )
-                    matches = [self._parse_mijn_korfbal_match(i) for i in items]
-                    matches = [m for m in matches if m is not None]
-                    if matches:
-                        _LOGGER.info("Scraped %d matches from HTML", len(matches))
-                        return matches
-                except json.JSONDecodeError:
-                    continue
-
-        _LOGGER.warning(
-            "Could not extract schedule from HTML. The SPA may require a headless browser. "
-            "Consider providing a Sportlink clientId for the official API."
-        )
-        return []

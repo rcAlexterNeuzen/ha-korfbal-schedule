@@ -43,7 +43,7 @@ class KorfbalCalendar(CoordinatorEntity[KorfbalScheduleCoordinator], CalendarEnt
     @property
     def event(self) -> CalendarEvent | None:
         """Return the next upcoming match as the current event."""
-        now = datetime.now(tz=self.coordinator.data[0].start.tzinfo if self.coordinator.data else None)
+        now = datetime.now().astimezone()
         upcoming = [
             m for m in (self.coordinator.data or [])
             if m.end > now and m.status != "cancelled"
