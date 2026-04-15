@@ -1,0 +1,23 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Korfbal Schedule instellen",
+        "description": "Voer de team- en clubcode in. Deze vind je in de URL op mijn.korfbal.nl.\nVoorbeeld URL: https://mijn.korfbal.nl/team/details/NCX35C2/T1200100098/programma",
+        "data": {
+          "club_code": "Clubcode (bijv. NCX35C2)",
+          "team_code": "Teamcode (bijv. T1200100098)",
+          "team_name": "Teamnaam (voor weergave)",
+          "sportlink_client_id": "Sportlink Client ID (optioneel, voor officiële API)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Kan geen verbinding maken met mijn.korfbal.nl",
+      "unknown": "Onbekende fout"
+    },
+    "abort": {
+      "already_configured": "Dit team is al ingesteld"
+    }
+  }
+}

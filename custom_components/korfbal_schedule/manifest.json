@@ -1,0 +1,11 @@
+{
+  "domain": "korfbal_schedule",
+  "name": "Korfbal Schedule",
+  "documentation": "https://github.com/yourusername/korfbal-ha",
+  "requirements": [],
+  "dependencies": [],
+  "codeowners": [],
+  "version": "1.0.0",
+  "iot_class": "cloud_polling",
+  "config_flow": true
+}
